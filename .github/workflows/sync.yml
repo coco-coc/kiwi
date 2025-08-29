@@ -1,0 +1,77 @@
+name: Sync Release APKs
+
+on:
+  schedule:
+    - cron: '0 4 * * *'   # 每天 UTC 4 点自动运行
+  workflow_dispatch:       # 支持手动触发
+
+jobs:
+  download-apks:
+    runs-on: ubuntu-latest
+    steps:
+      # 1️⃣ 检出你的仓库
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      # 2️⃣ 安装工具
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+
+      # 3️⃣ 下载上游 release APK
+      - name: Download release APKs
+        run: |
+          mkdir -p releases
+          page=1
+          total=0
+
+          echo "Fetching releases from kiwibrowser/src.next ..."
+          while true; do
+            response=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              "https://api.github.com/repos/kiwibrowser/src.next/releases?per_page=100&page=$page")
+
+            # 没有更多 release 就退出
+            if echo "$response" | jq -e 'length == 0' > /dev/null; then
+              break
+            fi
+
+            echo "$response" | jq -r '.[] | @base64' | while read release; do
+              _jq() { echo "$release" | base64 -d | jq -r "$1"; }
+
+              tag=$(_jq '.tag_name')
+              echo "Processing release $tag"
+              mkdir -p "releases/$tag"
+
+              assets=$(_jq '.assets | length')
+              for i in $(seq 0 $((assets-1))); do
+                name=$(echo "$release" | base64 -d | jq -r ".assets[$i].name")
+                url=$(echo "$release" | base64 -d | jq -r ".assets[$i].browser_download_url")
+
+                # 只下载 APK 文件
+                if [[ "$name" == *.apk ]]; then
+                  echo "Downloading $name ..."
+                  curl -L -o "releases/$tag/$name" "$url"
+                  total=$((total+1))
+                fi
+              done
+            done
+
+            page=$((page+1))
+          done
+
+          echo "✅ Downloaded $total APKs"
+
+      # 4️⃣ 提交并推送到你自己的仓库
+      - name: Commit and push APKs
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add releases/
+          if ! git diff-index --quiet HEAD --; then
+            git commit -m "chore: sync APK releases $(date +'%Y-%m-%d %H:%M')"
+            git push https://${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git HEAD
+          else
+            echo "No new APKs"
+          fi
