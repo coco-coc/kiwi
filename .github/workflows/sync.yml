@@ -1,4 +1,4 @@
-name: Sync Release APKs
+Name: Sync Release APKs
 
 on:
   schedule:
@@ -20,10 +20,15 @@ jobs:
           sudo apt-get install -y jq curl
 
       # 3️⃣ 下载 APK
-      - name: Download APKs by year
+      - name: Download and commit APKs
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # 配置 Git，增加缓冲区大小以处理大文件
+          git config http.postBuffer 524288000
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
           REPO="kiwibrowser/src.next"
           START_YEAR=2025
           END_YEAR=2015   # 根据需要调整
@@ -67,29 +72,29 @@ jobs:
                   fi
                 done
               done
-
               page=$((page+1))
             done
 
             echo "✅ $YEAR 年下载完成，共下载 $total_year 个 APK"
 
             # 4️⃣ 分批 commit & push，避免一次 push 太大
-            git config --global user.name "github-actions[bot]"
-            git config --global user.email "github-actions[bot]@users.noreply.github.com"
-            files=$(ls releases/$YEAR/*.apk 2>/dev/null || true)
-            batch=0
-            for f in $files; do
-              git add "$f"
-              batch=$((batch+1))
-              if [ $batch -ge 4 ]; then
-                git commit -m "chore: add APKs $YEAR batch"
-                git push https://${{ github.actor }}:$GITHUB_TOKEN@github.com/${{ github.repository }}.git HEAD
-                batch=0
+            files=$(ls "releases/$YEAR"/*.apk 2>/dev/null || true)
+            if [ -n "$files" ]; then
+              batch=0
+              for f in $files; do
+                git add "$f"
+                batch=$((batch+1))
+                if [ $batch -ge 4 ]; then
+                  git commit -m "chore: add APKs for $YEAR"
+                  git push
+                  batch=0
+                fi
+              done
+              # 提交剩余的文件
+              if [ $batch -gt 0 ]; then
+                git commit -m "chore: add remaining APKs for $YEAR"
+                git push
               fi
-            done
-            if [ $batch -gt 0 ]; then
-              git commit -m "chore: add remaining APKs $YEAR"
-              git push https://${{ github.actor }}:$GITHUB_TOKEN@github.com/${{ github.repository }}.git HEAD
             fi
 
             # 5️⃣ 清理临时日志
