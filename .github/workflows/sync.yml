@@ -1,37 +1,33 @@
-Name: Sync Release APKs
+name: Sync Release APKs # 将 'Name' 改为 'name'
 
 on:
   schedule:
-    - cron: '0 4 * * *'   # 每天 UTC 4 点自动运行
-  workflow_dispatch:       # 支持手动触发
+    - cron: '0 4 * * *'
+  workflow_dispatch:
 
 jobs:
   download-apks:
     runs-on: ubuntu-latest
     steps:
-      # 1️⃣ 检出你的仓库
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      # 2️⃣ 安装依赖
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y jq curl
 
-      # 3️⃣ 下载 APK
       - name: Download and commit APKs
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 配置 Git，增加缓冲区大小以处理大文件
           git config http.postBuffer 524288000
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
           REPO="kiwibrowser/src.next"
           START_YEAR=2025
-          END_YEAR=2015   # 根据需要调整
+          END_YEAR=2015
           mkdir -p releases
 
           for YEAR in $(seq $START_YEAR -1 $END_YEAR); do
@@ -44,12 +40,10 @@ jobs:
               response=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
                 "https://api.github.com/repos/$REPO/releases?per_page=100&page=$page")
 
-              # 没有更多 release 就退出
               if echo "$response" | jq -e 'length == 0' > /dev/null; then
                 break
               fi
 
-              # 遍历 release
               echo "$response" | jq -r '.[] | @base64' | while read release; do
                 _jq() { echo "$release" | base64 -d | jq -r "$1"; }
                 published=$(echo $(_jq '.published_at') | cut -d'-' -f1)
@@ -77,7 +71,6 @@ jobs:
 
             echo "✅ $YEAR 年下载完成，共下载 $total_year 个 APK"
 
-            # 4️⃣ 分批 commit & push，避免一次 push 太大
             files=$(ls "releases/$YEAR"/*.apk 2>/dev/null || true)
             if [ -n "$files" ]; then
               batch=0
@@ -90,15 +83,12 @@ jobs:
                   batch=0
                 fi
               done
-              # 提交剩余的文件
               if [ $batch -gt 0 ]; then
                 git commit -m "chore: add remaining APKs for $YEAR"
                 git push
               fi
             fi
 
-            # 5️⃣ 清理临时日志
             echo "清理临时日志..."
             rm -f /home/runner/work/_temp/*.log || true
-
           done
