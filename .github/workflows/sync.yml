@@ -3,7 +3,7 @@ name: Sync Release APKs by Year
 on:
   schedule:
     - cron: '0 4 * * *'  # 每天 UTC 4 点自动运行
-  workflow_dispatch:
+  workflow_dispatch:     # 支持手动触发
 
 jobs:
   download-apks:
@@ -19,65 +19,81 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq curl
 
-      # 3️⃣ 下载 APK（按年份）
+      # 3️⃣ 下载 APKs 按年份存放
       - name: Download release APKs by year
         run: |
-          REPO="kiwibrowser/src.next"
-          mkdir -p releases
-          
-          CURRENT_YEAR=$(date +%Y)
-          START_YEAR=2023  # 可以修改为你想下载的最早年份
+          REPO="kiwibrowser/src.next"   # 替换为目标仓库
+          START_YEAR=2025               # 起始年份
+          END_YEAR=2020                 # 结束年份
+          DOWNLOAD_DIR="releases"
 
-          for YEAR in $(seq $CURRENT_YEAR -1 $START_YEAR); do
+          mkdir -p "$DOWNLOAD_DIR"
+
+          for YEAR in $(seq $START_YEAR -1 $END_YEAR); do
             echo "=== 下载年份 $YEAR 的 Release ==="
-            mkdir -p "releases/$YEAR"
-            
+            YEAR_DIR="$DOWNLOAD_DIR/$YEAR"
+            mkdir -p "$YEAR_DIR"
+
             page=1
             total=0
 
             while true; do
               RESPONSE=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
                 "https://api.github.com/repos/$REPO/releases?per_page=100&page=$page")
-              
-              # 检查是否是空页或限流
-              if echo "$RESPONSE" | jq -e 'length==0' > /dev/null 2>&1; then
+
+              # 如果 API 返回空或者报错则退出
+              if echo "$RESPONSE" | jq -e 'length == 0' > /dev/null; then
                 break
               fi
 
-              echo "$RESPONSE" | jq -c '.[]' | while read RELEASE; do
-                TAG_DATE=$(echo "$RELEASE" | jq -r '.published_at' | cut -d'-' -f1)
-                
-                if [ "$TAG_DATE" -eq "$YEAR" ]; then
-                  TAG_NAME=$(echo "$RELEASE" | jq -r '.tag_name')
-                  echo "Processing release $TAG_NAME ($TAG_DATE)"
-                  mkdir -p "releases/$YEAR/$TAG_NAME"
-                  
-                  ASSET_COUNT=$(echo "$RELEASE" | jq '.assets | length')
-                  for i in $(seq 0 $((ASSET_COUNT-1))); do
-                    ASSET_NAME=$(echo "$RELEASE" | jq -r ".assets[$i].name")
-                    DOWNLOAD_URL=$(echo "$RELEASE" | jq -r ".assets[$i].browser_download_url")
-                    
-                    if [[ "$ASSET_NAME" == *.apk ]]; then
-                      SAVE_PATH="releases/$YEAR/$TAG_NAME/$ASSET_NAME"
-                      echo "Downloading $ASSET_NAME ..."
-                      
-                      curl -L -o "$SAVE_PATH" "$DOWNLOAD_URL"
-                      total=$((total+1))
-                    fi
-                  done
+              echo "$RESPONSE" | jq -r '.[] | @base64' | while read release; do
+                _jq() { echo "$release" | base64 --decode | jq -r "$1"; }
+
+                tag_date=$(_jq '.published_at' | cut -d'-' -f1)
+                tag_name=$(_jq '.tag_name')
+
+                # 判断年份
+                if [ "$tag_date" != "$YEAR" ]; then
+                  continue
                 fi
+
+                echo "Processing release $tag_name ($YEAR)"
+                mkdir -p "$YEAR_DIR/$tag_name"
+
+                assets_count=$(_jq '.assets | length')
+                for i in $(seq 0 $((assets_count-1))); do
+                  name=$(_jq ".assets[$i].name")
+                  url=$(_jq ".assets[$i].browser_download_url")
+
+                  # 只下载 APK 文件
+                  if [[ "$name" == *.apk ]]; then
+                    SAVE_PATH="$YEAR_DIR/$tag_name/$name"
+                    if [ -f "$SAVE_PATH" ]; then
+                      echo "文件已存在，跳过: $name"
+                      continue
+                    fi
+
+                    # 下载带重试
+                    for attempt in 1 2 3; do
+                      echo "Downloading $name (尝试 $attempt)..."
+                      curl -L -o "$SAVE_PATH" "$url" && break
+                      echo "⚠️ 下载失败，重试 $attempt 次..."
+                      sleep $((2*attempt))
+                    done
+                    total=$((total+1))
+                  fi
+                done
               done
 
               page=$((page+1))
             done
 
-            echo "✅ 年份 $YEAR 下载完成，共 $total 个 APK"
-            
-            # 清理缓存或日志，防止下次重复下载
-            rm -f /tmp/releases_cache_$YEAR.json || true
+            echo "✅ $YEAR 年下载完成，共下载 $total 个 APK"
+            echo "清理临时日志..."
+            rm -f /home/runner/work/_temp/*.log || true
           done
 
-      # 4️⃣ 提交并推送
+      # 4️⃣ 提交并推送到仓库
       - name: Commit and push APKs
         run: |
           git config --global user.name "github-actions[bot]"
@@ -85,7 +101,8 @@ jobs:
 
           git add releases/
           if ! git diff-index --quiet HEAD --; then
-            git commit -m "chore: sync APK releases $(date +'%Y-%m-%d %H:%M')"
+            git commit -m "chore: sync APK releases by year $(date +'%Y-%m-%d %H:%M')"
             git push https://${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git HEAD
           else
             echo "No new APKs"
+          fi
