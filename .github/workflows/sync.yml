@@ -9,7 +9,7 @@ jobs:
   download-apks:
     runs-on: ubuntu-latest
     steps:
-      # 1️⃣ 检出仓库
+      # 1️⃣ 检出你的仓库
       - name: Checkout repository
         uses: actions/checkout@v3
 
@@ -19,67 +19,56 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq curl
 
-      # 3️⃣ 下载 Release APK，按年份分类
-      - name: Download APKs by year
+      # 3️⃣ 下载 Release APK（按年份）
+      - name: Download release APKs by year
         run: |
-          REPO="kiwibrowser/src.next"
-          BASE_DIR="releases"
-          mkdir -p "$BASE_DIR"
-
-          echo "Fetching releases from $REPO ..."
-          PAGE=1
+          mkdir -p releases
           TOTAL=0
 
-          while true; do
-            RESPONSE=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-              "https://api.github.com/repos/$REPO/releases?per_page=100&page=$PAGE")
+          # 获取所有 Releases
+          RELEASES=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/kiwibrowser/src.next/releases?per_page=100")
 
-            if echo "$RESPONSE" | jq -e 'length == 0' > /dev/null; then
-              break
-            fi
+          # 获取所有年份列表，从最新到最旧
+          YEARS=$(echo "$RELEASES" | jq -r '.[].published_at[:4]' | sort -u -r)
 
-            echo "$RESPONSE" | jq -r '.[] | @base64' | while read RELEASE; do
-              _jq() { echo "$RELEASE" | base64 --decode | jq -r "$1"; }
-
-              TAG=$(_jq '.tag_name')
-              PUBLISHED_AT=$(_jq '.published_at')
-              YEAR=$(date -d "$PUBLISHED_AT" +%Y)
-              YEAR_DIR="$BASE_DIR/$YEAR"
-              mkdir -p "$YEAR_DIR/$TAG"
-
-              ASSETS=$(_jq '.assets | length')
-              for I in $(seq 0 $((ASSETS-1))); do
-                NAME=$(_jq ".assets[$I].name")
-                URL=$(_jq ".assets[$I].browser_download_url")
-
-                # 只下载 APK
+          for YEAR in $YEARS; do
+            echo "=== 下载年份 $YEAR 的 Release ==="
+            
+            # 筛选该年份的 Release
+            echo "$RELEASES" | jq -c ".[] | select(.published_at[:4]==\"$YEAR\")" | while read release; do
+              TAG=$(echo "$release" | jq -r '.tag_name')
+              YEAR_DIR="releases/$YEAR/$TAG"
+              mkdir -p "$YEAR_DIR"
+              
+              # 下载 APK 文件
+              ASSETS=$(echo "$release" | jq -c '.assets[]')
+              echo "$ASSETS" | while read asset; do
+                NAME=$(echo "$asset" | jq -r '.name')
+                URL=$(echo "$asset" | jq -r '.browser_download_url')
+                
                 if [[ "$NAME" == *.apk ]]; then
-                  SAVE_PATH="$YEAR_DIR/$TAG/$NAME"
+                  SAVE_PATH="$YEAR_DIR/$NAME"
                   if [[ -f "$SAVE_PATH" ]]; then
-                    echo "APK exists, skipping: $YEAR/$TAG/$NAME"
+                    echo "文件已存在，跳过: $NAME"
                   else
-                    echo "Downloading $YEAR/$TAG/$NAME ..."
-                    for ATTEMPT in 1 2 3; do
-                      if curl -sL -o "$SAVE_PATH" "$URL"; then
-                        echo "✅ Downloaded $YEAR/$TAG/$NAME"
-                        TOTAL=$((TOTAL+1))
-                        break
-                      else
-                        echo "⚠️ Download failed, retry $ATTEMPT ..."
-                        sleep $((ATTEMPT*2))
-                      fi
-                    done
+                    echo "Downloading $NAME ..."
+                    curl -L --retry 5 --retry-delay 5 -o "$SAVE_PATH" "$URL"
+                    TOTAL=$((TOTAL+1))
                   fi
                 fi
               done
             done
 
-            PAGE=$((PAGE+1))
+            # 清理 Runner 临时缓存，避免磁盘满
+            echo "清理 Runner 缓存..."
+            rm -rf /home/runner/work/_temp/*
+            rm -rf /home/runner/work/_actions/*
           done
 
-          echo "✅ Total APKs downloaded: $TOTAL"
+          echo "✅ 下载完成，总计 APK: $TOTAL"
 
-      # 4️⃣ 提交并推送 APK
+      # 4️⃣ 提交并推送 APK 到仓库
       - name: Commit and push APKs
         run: |
           git config --global user.name "github-actions[bot]"
@@ -92,11 +81,3 @@ jobs:
           else
             echo "No new APKs to commit"
           fi
-
-      # 5️⃣ 清理 runner 临时文件
-      - name: Clean up runner temp
-        run: |
-          echo "Cleaning runner temp files..."
-          rm -rf /home/runner/work/_temp/*
-          rm -rf /home/runner/work/_actions/*
-          echo "Cleanup completed"
