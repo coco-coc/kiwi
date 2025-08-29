@@ -1,80 +1,102 @@
 name: Sync Release APKs by Year
 
 on:
+  workflow_dispatch: # 手动触发
   schedule:
-    - cron: '0 4 * * *'   # 每天 UTC 4 点自动运行
-  workflow_dispatch:       # 支持手动触发
+    - cron: '0 4 * * *' # 每天 UTC 4 点运行
 
 jobs:
   download-apks:
     runs-on: ubuntu-latest
-
     steps:
-      # 1️⃣ 检出仓库
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      # 2️⃣ 安装工具
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y jq curl
 
-      # 3️⃣ 下载 Release APKs 按年份
-      - name: Download release APKs by year
-        env:
-          REPO: kiwibrowser/src.next  # 替换为目标仓库
+      - name: Set variables
         run: |
+          REPO="kiwibrowser/src.next"  # 替换为目标仓库
+          START_YEAR=2025              # 从哪一年开始
+          END_YEAR=2018                # 下载到哪一年
           mkdir -p releases
 
-          # 获取所有 Release
-          response=$(curl -s "https://api.github.com/repos/$REPO/releases?per_page=100")
-          
-          # 获取所有年份
-          years=$(echo "$response" | jq -r '.[].created_at' | cut -d'-' -f1 | sort -r | uniq)
-          
-          for year in $years; do
-            echo "=== 下载年份 $year 的 Release ==="
-            mkdir -p "releases/$year"
-            
-            echo "$response" | jq -r '.[] | @base64' | while read release; do
-              _jq() { echo "$release" | base64 --decode | jq -r "$1"; }
-              tag=$(_jq '.tag_name')
-              created_at=$(_jq '.created_at' | cut -d'-' -f1)
-              if [ "$created_at" != "$year" ]; then
-                continue
-              fi
-              echo "Processing release $tag ($created_at)"
+          echo "REPO=$REPO" >> $GITHUB_ENV
+          echo "START_YEAR=$START_YEAR" >> $GITHUB_ENV
+          echo "END_YEAR=$END_YEAR" >> $GITHUB_ENV
 
-              assets_count=$(_jq '.assets | length')
-              for i in $(seq 0 $((assets_count-1))); do
-                name=$(_jq ".assets[$i].name")
-                url=$(_jq ".assets[$i].browser_download_url")
-                if [[ "$name" == *.apk ]]; then
-                  save_path="releases/$year/$name"
-                  if [ -f "$save_path" ]; then
-                    echo "已存在，跳过 $name"
-                    continue
-                  fi
-                  echo "Downloading $name ..."
-                  curl -L -o "$save_path" "$url"
+      - name: Download APKs by year
+        run: |
+          for YEAR in $(seq $START_YEAR -1 $END_YEAR); do
+            echo "=== Downloading Releases for $YEAR ==="
+            YEAR_DIR="releases/$YEAR"
+            mkdir -p "$YEAR_DIR"
+
+            page=1
+            total=0
+
+            while true; do
+              RESPONSE=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                "https://api.github.com/repos/$REPO/releases?per_page=100&page=$page")
+
+              # 没有更多 release 就退出
+              if echo "$RESPONSE" | jq -e 'length == 0' > /dev/null; then
+                break
+              fi
+
+              echo "$RESPONSE" | jq -r '.[] | @base64' | while read release; do
+                _jq() { echo "$release" | base64 -d | jq -r "$1"; }
+                TAG=$(_jq '.tag_name')
+                PUBLISHED_AT=$(_jq '.published_at' | cut -d"-" -f1)
+
+                # 只下载指定年份的 Release
+                if [ "$PUBLISHED_AT" != "$YEAR" ]; then
+                  continue
                 fi
+
+                echo "Processing release $TAG ($YEAR)"
+                ASSETS=$(_jq '.assets | length')
+                for i in $(seq 0 $((ASSETS-1))); do
+                  NAME=$(echo "$release" | base64 -d | jq -r ".assets[$i].name")
+                  URL=$(echo "$release" | base64 -d | jq -r ".assets[$i].browser_download_url")
+
+                  # 只下载 APK
+                  if [[ "$NAME" == *.apk ]]; then
+                    SAVE_PATH="$YEAR_DIR/$NAME"
+
+                    if [ -f "$SAVE_PATH" ]; then
+                      echo "File exists, skip: $NAME"
+                      continue
+                    fi
+
+                    echo "Downloading $NAME ..."
+                    curl -L -o "$SAVE_PATH" "$URL"
+                    total=$((total+1))
+                  fi
+                done
               done
+
+              page=$((page+1))
             done
 
-            # 清理日志/临时数据
-            echo "清理临时日志..."
-            rm -f *.log *.tmp 2>/dev/null
-          done
+            echo "✅ $YEAR downloads completed, total APKs: $total"
 
-      # 4️⃣ 提交并推送到仓库
-      - name: Commit and push APKs
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add releases/
-          if ! git diff-index --quiet HEAD --; then
-            git commit -m "chore: sync APK releases $(date +'%Y-%m-%d %H:%M')"
-            git push origin HEAD
-          else
-            echo "No new APKs"
+            # 清理临时日志，减少磁盘占用
+            rm -f *.log *.tmp || true
+
+            # commit & push
+            git config --global user.name "github-actions[bot]"
+            git config --global user.email "github-actions[bot]@users.noreply.github.com"
+            git add "$YEAR_DIR/"
+            if ! git diff-index --quiet HEAD --; then
+              git commit -m "chore: sync APK releases $YEAR ($(date +'%Y-%m-%d %H:%M'))"
+              git push https://${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git HEAD
+            else
+              echo "No new APKs for $YEAR"
+            fi
+
+            echo "=== Finished $YEAR ==="
+          done
