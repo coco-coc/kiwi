@@ -1,12 +1,12 @@
-name: Sync Release APKs # 将 'Name' 改为 'name'
+name: Sync Release to My Repo
 
 on:
   schedule:
-    - cron: '0 4 * * *'
-  workflow_dispatch:
+    - cron: '0 4 * * *'   # 每天 UTC 4 点自动运行
+  workflow_dispatch:       # 支持手动触发
 
 jobs:
-  download-apks:
+  sync-releases:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -17,78 +17,85 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq curl
 
-      - name: Download and commit APKs
+      - name: Sync Releases
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_REPO: kiwibrowser/src.next  # 源仓库
+          TARGET_REPO: ${{ github.repository }} # 目标仓库（即你自己的仓库）
         run: |
-          git config http.postBuffer 524288000
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          echo "同步 ${SOURCE_REPO} 的所有 Release 到 ${TARGET_REPO}"
+          
+          # 获取源仓库的所有 Release
+          releases=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/repos/${SOURCE_REPO}/releases?per_page=100")
 
-          REPO="kiwibrowser/src.next"
-          START_YEAR=2025
-          END_YEAR=2015
-          mkdir -p releases
+          echo "$releases" | jq -r '.[] | @base64' | while read release; do
+            _jq() { echo "$release" | base64 -d | jq -r "$1"; }
 
-          for YEAR in $(seq $START_YEAR -1 $END_YEAR); do
-            echo "=== 下载年份 $YEAR 的 Release ==="
-            mkdir -p "releases/$YEAR"
-            page=1
-            total_year=0
+            tag=$(_jq '.tag_name')
+            release_id=$(_jq '.id')
+            title=$(_jq '.name')
+            body=$(_jq '.body')
+            draft=$(_jq '.draft')
+            prerelease=$(_jq '.prerelease')
 
-            while true; do
-              response=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
-                "https://api.github.com/repos/$REPO/releases?per_page=100&page=$page")
+            # 检查这个 Release 是否已存在于目标仓库
+            # 获取目标仓库的 Release 列表
+            target_releases=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+              "https://api.github.com/repos/${TARGET_REPO}/releases/tags/${tag}")
 
-              if echo "$response" | jq -e 'length == 0' > /dev/null; then
-                break
-              fi
+            if [[ $(echo "$target_releases" | jq -r '.message') != "Not Found" ]]; then
+              echo "Release with tag ${tag} already exists. Skipping..."
+              continue
+            fi
+            
+            echo "---"
+            echo "发现新 Release: ${tag}"
 
-              echo "$response" | jq -r '.[] | @base64' | while read release; do
-                _jq() { echo "$release" | base64 -d | jq -r "$1"; }
-                published=$(echo $(_jq '.published_at') | cut -d'-' -f1)
+            # 1. 在目标仓库创建新的 Release
+            create_release_payload=$(jq -n --arg tag "$tag" --arg title "$title" --arg body "$body" --arg draft "$draft" --arg prerelease "$prerelease" '{
+              "tag_name": $tag,
+              "name": $title,
+              "body": $body,
+              "draft": ($draft | test("true")),
+              "prerelease": ($prerelease | test("true"))
+            }')
 
-                if [ "$published" != "$YEAR" ]; then
-                  continue
-                fi
+            new_release=$(curl -s -X POST -H "Authorization: token $GITHUB_TOKEN" -H "Content-Type: application/json" \
+              -d "$create_release_payload" \
+              "https://api.github.com/repos/${TARGET_REPO}/releases")
 
-                tag=$(_jq '.tag_name')
-                echo "Processing release $tag ($YEAR)"
-                assets=$(_jq '.assets | length')
-
-                for i in $(seq 0 $((assets-1))); do
-                  name=$(echo "$release" | base64 -d | jq -r ".assets[$i].name")
-                  url=$(echo "$release" | base64 -d | jq -r ".assets[$i].browser_download_url")
-                  if [[ "$name" == *.apk ]]; then
-                    echo "Downloading $name ..."
-                    curl -L -o "releases/$YEAR/$name" "$url"
-                    total_year=$((total_year+1))
-                  fi
-                done
-              done
-              page=$((page+1))
-            done
-
-            echo "✅ $YEAR 年下载完成，共下载 $total_year 个 APK"
-
-            files=$(ls "releases/$YEAR"/*.apk 2>/dev/null || true)
-            if [ -n "$files" ]; then
-              batch=0
-              for f in $files; do
-                git add "$f"
-                batch=$((batch+1))
-                if [ $batch -ge 4 ]; then
-                  git commit -m "chore: add APKs for $YEAR"
-                  git push
-                  batch=0
-                fi
-              done
-              if [ $batch -gt 0 ]; then
-                git commit -m "chore: add remaining APKs for $YEAR"
-                git push
-              fi
+            new_release_id=$(echo "$new_release" | jq -r '.id')
+            if [ "$new_release_id" == "null" ]; then
+              echo "Error creating new release: $(echo "$new_release" | jq -r '.message')"
+              continue
             fi
 
-            echo "清理临时日志..."
-            rm -f /home/runner/work/_temp/*.log || true
+            echo "成功创建 Release (ID: ${new_release_id})"
+            
+            # 2. 下载源 Release 的 APK 附件并上传
+            assets=$(echo "$release" | base64 -d | jq -r '.assets[] | @base64')
+            echo "$assets" | while read asset; do
+              asset_jq() { echo "$asset" | base64 -d | jq -r "$1"; }
+              name=$(asset_jq '.name')
+              url=$(asset_jq '.browser_download_url')
+              content_type=$(asset_jq '.content_type')
+              
+              if [[ "$name" == *.apk ]]; then
+                echo "Downloading asset ${name}..."
+                curl -L -o "$name" "$url"
+
+                echo "Uploading asset ${name} to new release..."
+                upload_url="https://uploads.github.com/repos/${TARGET_REPO}/releases/${new_release_id}/assets?name=${name}"
+                
+                curl -s -X POST -H "Authorization: token $GITHUB_TOKEN" \
+                  -H "Content-Type: ${content_type}" \
+                  --data-binary "@${name}" \
+                  "$upload_url"
+                
+                echo "✅ Asset ${name} uploaded."
+                rm "$name"
+              fi
+            done
           done
+          echo "同步任务完成。"
